@@ -47,6 +47,7 @@ module cacherand
 );
 
   localparam                           LOGNUMWAYS = $clog2(NUMWAYS);
+  localparam                           LFSRWIDTH = LOGNUMWAYS + 2;
 
   logic [NUMWAYS-2:0]                  LRUMemory [NUMLINES-1:0];
   logic [NUMWAYS-2:0]                  CurrLRU;
@@ -84,93 +85,52 @@ module cacherand
   // coverage on
 
   // On a miss we need to ignore HitWay and derive the new replacement bits with the VictimWay.
-  mux2 #(LOGNUMWAYS) WayMuxEnc(HitWayEncoded, VictimWayEnc, SetValid, Way);
+  mux2 #(LFSRWIDTH) WayMuxEnc(HitWayEncoded, VictimWayEnc, SetValid, Way);
 
-  // bit duplication
-  // expand HitWay as HitWay[3], {{2}{HitWay[2]}}, {{4}{HitWay[1]}, {{8{HitWay[0]}}, ...
-  for(row = 0; row < LOGNUMWAYS; row++) begin
-    localparam integer DuplicationFactor = 2**(LOGNUMWAYS-row-1);
-    localparam StartIndex = NUMWAYS-2 - DuplicationFactor + 1;
-    localparam EndIndex = NUMWAYS-2 - 2 * DuplicationFactor + 2;
-    assign WayExpanded[StartIndex : EndIndex] = {{DuplicationFactor}{Way[row]}};
-  end
-
-  genvar               node;
-  assign LRUUpdate[NUMWAYS-2] = '1;
-  for(node = NUMWAYS-2; node >= NUMWAYS/2; node--) begin : enables
-    localparam ctr = NUMWAYS - node - 1;
-    localparam ctr_depth = log2(ctr);
-    localparam lchild = node - ctr;
-    localparam rchild = lchild - 1;
-    localparam r = LOGNUMWAYS - ctr_depth;
-
-    // the child node will be updated if its parent was updated and
-    // the Way bit was the correct value.
-    // The if statement is only there for coverage since LRUUpdate[root] is always 1.
-    if (node == NUMWAYS-2) begin
-      assign LRUUpdate[lchild] = ~Way[r];
-      assign LRUUpdate[rchild] = Way[r];
-    end else begin
-      assign LRUUpdate[lchild] = LRUUpdate[node] & ~Way[r];
-      assign LRUUpdate[rchild] = LRUUpdate[node] & Way[r];
-    end
-  end
-
-  // The root node of the LRU tree will always be selected in LRUUpdate. No mux needed.
-  assign NextLRU[NUMWAYS-2] = ~WayExpanded[NUMWAYS-2];
-  if (NUMWAYS > 2) mux2 #(1) LRUMuxes[NUMWAYS-3:0](CurrLRU[NUMWAYS-3:0], ~WayExpanded[NUMWAYS-3:0], LRUUpdate[NUMWAYS-3:0], NextLRU[NUMWAYS-3:0]);
-
-  // Compute next victim way.
-  for(node = NUMWAYS-2; node >= NUMWAYS/2; node--) begin
-    localparam t0 = 2*node - NUMWAYS;
-    localparam t1 = t0 + 1;
-    assign Intermediate[node] = CurrLRU[node] ? Intermediate[t0] : Intermediate[t1];
-  end
-  for(node = NUMWAYS/2-1; node >= 0; node--) begin
-    localparam int0 = (NUMWAYS/2-1-node)*2;
-    localparam int1 = int0 + 1;
-    assign Intermediate[node] = CurrLRU[node] ? int1[LOGNUMWAYS-1:0] : int0[LOGNUMWAYS-1:0];
-  end
-
+  logic [WIDTH-1:0] load_val;
+  case(WIDTH):
+    3: assign load_val = 3'b101;
+    4: assign load_val = 4'b1010;
+    5: assign load_val = 5'b10101;
+    6: assign load_val = 6'b101010;
+    7: assign load_val = 7'b1010101;
+    8: assign load_val = 8'b10101010;
+    9: assign load_val = 9'b101010101;
+  endcase 
   logic next;
+  logic LFSR_en;
+  assgin LFSR_en = ~FlushStage & LRUWriteEn;
   logic [3:0] CurrRandom;
-  flopenl #(4) lsrf(clk, rst, LRUWriteEn, .val(4'b1), .d((next, CurrRandom[3:1])), .q(CurrRandom)); 
-  assign next = CurrRandom[0] ^ CurrRandom[1];
+  flopenl #(4) lfsr(clk, .load(rst), .en(LFSR_en), .d((next, CurrRandom[3:1])), .val(load_val), .q(CurrRandom)); 
+
+  case(WIDTH):
+    3: assign next = curr[2]^curr[0];
+    4: assign next = curr[3]^curr[0];
+    5: assign next = curr[4]^curr[3]^curr[2]^curr[0];
+    6: assign next = curr[5]^curr[4]^curr[2]^curr[1];
+    7: assign next = curr[6]^curr[5]^curr[3]^curr[0];
+    8: assign next = curr[7]^curr[5]^curr[2]^curr[1];
+    9: assign next = curr[8]^curr[6]^curr[5]^curr[4]^curr[3]^curr[2];
+  endcase 
 
   priorityonehot #(NUMWAYS) FirstZeroEncoder(~ValidWay, FirstZero);
   binencoder #(NUMWAYS) FirstZeroWayEncoder(FirstZero, FirstZeroWay);
-  mux2 #(LOGNUMWAYS) VictimMux(FirstZeroWay, Intermediate[NUMWAYS-2], AllValid, VictimWayEnc);
+  mux2 #(LOGNUMWAYS) VictimMux(FirstZeroWay, CurrRandom[$clog2(NUMWAYS)-1:0], AllValid, VictimWayEnc);
   decoder #(LOGNUMWAYS) decoder (VictimWayEnc, VictimWay);
 
-  // LRU storage must be reset for modelsim to run. However the reset value does not actually matter in practice.
-  // This is a two port memory.
-  // Every cycle must read from CacheSetData and each load/store must write the new LRU.
-
-  // note: Verilator lint doesn't like <= for array initialization (https://verilator.org/warn/BLKLOOPINIT?v=5.021)
-  // Move to = to keep Verilator happy and simulator running fast
-  always_ff @(posedge clk) begin
-    if (reset | (InvalidateCache & ~FlushStage)) 
-      for (int set = 0; set < NUMLINES; set++) LRUMemory[set] = 0; // exclusion-tag: initialize
-    else if(CacheEn) begin
-      // Because we are using blocking assignments, change to LRUMemory must occur after LRUMemory is used so we get the proper value
-      if(LRUWriteEn & (PAdr == CacheSetTag)) CurrLRU = NextLRU;
-      else                                   CurrLRU = LRUMemory[CacheSetTag];
-      if(LRUWriteEn)                         LRUMemory[PAdr] = NextLRU;
-    end
-  end
-
 endmodule
 
-module flopenl #(parameter WIDTH = 8)
-   (input  logic             clk, en,
-    input  logic [WIDTH-1:0] load_val,
-    input logic [WIDTH-1:0]  d, 
-    output logic [WIDTH-1:0] q);
+module flopenl #(parameter WIDTH = 8, parameter type TYPE=logic [WIDTH-1:0]) (
+  input  logic clk, load, en,
+  input  TYPE d,
+  input  TYPE val,
+  output TYPE q);
 
-   always_ff @(posedge clk, posedge load)
-    if (en) q <= d;
-    else    q <= load_val;
+  always_ff @(posedge clk)
+    if (load)    q <= val;
+    else if (en) q <= d;
 endmodule
+
 
 
 
